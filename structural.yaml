@@ -1,0 +1,203 @@
+name: ALI Normality Score Calculator
+description: "Computes regime sub-vector normality scores for ALI C2 fields per market x year. Outputs latest, all-years, or both. ALI_C2_CONFIG hardcoded; REGIME_DIMS and total vector size configurable."
+
+inputs:
+  - {name: e_m_data,          type: Data,    description: "Input directory containing the e_m embeddings CSV file"}
+  - {name: total_vector_size, type: Integer, default: "320",   description: "Total dimensionality of the e_m embedding vector (e_0 to e_N-1)"}
+  - {name: output_mode,       type: String,  default: "both",  description: "Output mode: latest, all, or both"}
+  - {name: round_decimals,    type: Integer, default: "6",     description: "Decimal places to round output normality scores"}
+  - {name: regime_dims,       type: String,  description: "Required JSON string mapping regime_key to [start, end] e.g. {political:[0,32],agency:[288,320]}"}
+
+outputs:
+  - {name: ali_normality_scores,          type: Data, description: "ali_normality_scores.csv — latest year per market (indexed by market)"}
+  - {name: ali_normality_scores_all_years, type: Data, description: "ali_normality_scores_all_years.csv — all years (no index)"}
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:v1
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, json, logging
+        import numpy as np
+        import pandas as pd
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--e_m_data',                          required=True)
+        parser.add_argument('--total_vector_size',                 type=int, default=320)
+        parser.add_argument('--output_mode',                       type=str, default='both',
+                            choices=['latest', 'all', 'both'])
+        parser.add_argument('--round_decimals',                    type=int, default=6)
+        parser.add_argument('--regime_dims',                       type=str, required=True)
+        parser.add_argument('--ali_normality_scores',              required=True)
+        parser.add_argument('--ali_normality_scores_all_years',    required=True)
+        args = parser.parse_args()
+
+        logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+        logger = logging.getLogger("ali_normality_score_calculator")
+
+        if not args.regime_dims or args.regime_dims.strip() in ('{}', '', 'null'):
+            raise ValueError("regime_dims is required — pass a non-empty JSON string mapping regime_key to [start, end]")
+        REGIME_DIMS = {k: [int(v[0]), int(v[1])] for k, v in json.loads(args.regime_dims).items()}
+        logger.info("REGIME_DIMS loaded from input  keys=%d", len(REGIME_DIMS))
+
+        TOTAL_VECTOR_SIZE = args.total_vector_size
+        E_COLS            = [f"e_{i}" for i in range(TOTAL_VECTOR_SIZE)]
+
+        ALI_C2_CONFIG = {
+            "D":  ("techprod",                     True),
+            "IA": (["measurement", "operational"], False),
+            "CF": ("coordination",                 False),
+            "RP": ("regulatory",                   True),
+            "F":  ("agency",                       False),
+        }
+
+        ALI_FIELDS = list(ALI_C2_CONFIG.keys())
+
+        def resolve_csv_path(input_dir, stem):
+            candidates = [
+                os.path.join(input_dir, stem + ".csv"),
+                os.path.join(input_dir, stem),
+            ]
+            for path in candidates:
+                if os.path.isfile(path):
+                    logger.info("Resolved input file: %s", path)
+                    return path
+            for fname in os.listdir(input_dir):
+                if fname.endswith(".csv"):
+                    path = os.path.join(input_dir, fname)
+                    logger.warning("Fallback CSV file used: %s", path)
+                    return path
+            all_files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+            if all_files:
+                path = os.path.join(input_dir, all_files[0])
+                logger.warning("Last-resort file used: %s", path)
+                return path
+            raise FileNotFoundError("No readable input file found in: %s  contents: %s" % (input_dir, os.listdir(input_dir)))
+
+        def compute_normality_row(row):
+            e_m        = np.array([float(row[c]) for c in E_COLS], dtype=np.float64)
+            total_norm = float(np.linalg.norm(e_m))
+            if total_norm == 0 or not np.isfinite(total_norm):
+                return {f: np.nan for f in ALI_FIELDS}
+            results = {}
+            for field, (regime_key, inverted) in ALI_C2_CONFIG.items():
+                if isinstance(regime_key, list):
+                    slices   = np.concatenate([e_m[REGIME_DIMS[r][0]:REGIME_DIMS[r][1]] for r in regime_key])
+                    sub_norm = float(np.linalg.norm(slices))
+                else:
+                    s, e     = REGIME_DIMS[regime_key]
+                    sub_norm = float(np.linalg.norm(e_m[s:e]))
+                fraction       = sub_norm / total_norm
+                results[field] = round((1.0 - fraction) if inverted else fraction, args.round_decimals)
+            return results
+
+        def compute_all(df):
+            records = []
+            for _, row in df.iterrows():
+                missing = [c for c in E_COLS if c not in row]
+                if missing:
+                    logger.warning("Row market=%s year=%s missing %d e_m cols — skipping",
+                                   row.get("market"), row.get("year"), len(missing))
+                    continue
+                scores = compute_normality_row(row)
+                record = {"market": row["market"], "year": int(row["year"])}
+                record.update(scores)
+                records.append(record)
+            return pd.DataFrame(records)
+
+        def get_latest_year(df_all):
+            idx = df_all.groupby("market")["year"].idxmax()
+            return df_all.loc[idx].drop(columns=["year"]).set_index("market")
+
+        def report_nulls(df_latest):
+            null_counts = df_latest.isna().sum()
+            null_counts  = null_counts[null_counts > 0]
+            if not null_counts.empty:
+                logger.warning("Null ALI normality scores detected:")
+                for field, cnt in null_counts.items():
+                    markets = df_latest[df_latest[field].isna()].index.tolist()
+                    logger.warning("  %s (%d): %s", field, cnt, markets)
+            else:
+                logger.info("No null ALI normality scores found.")
+
+        try:
+            logger.info("Scanning e_m_data dir: %s  contents=%s", args.e_m_data, os.listdir(args.e_m_data))
+            csv_path = resolve_csv_path(args.e_m_data, "mock_e_m")
+            df_raw   = pd.read_csv(csv_path)
+            assert "market" in df_raw.columns, "Missing 'market' column"
+            assert "year"   in df_raw.columns, "Missing 'year' column"
+            assert "e_0"    in df_raw.columns, "Missing e_m vector columns (e_0 ...)"
+            logger.info("Loaded shape=%s  total_vector_size=%d  output_mode=%s",
+                        df_raw.shape, TOTAL_VECTOR_SIZE, args.output_mode)
+
+            df_all    = compute_all(df_raw)
+            df_latest = get_latest_year(df_all)
+
+            logger.info("=== ALI Normality Scores (latest year) ===")
+            logger.info("%s", df_latest[ALI_FIELDS].round(4).to_string())
+            report_nulls(df_latest)
+
+            os.makedirs(args.ali_normality_scores,            exist_ok=True)
+            os.makedirs(args.ali_normality_scores_all_years,  exist_ok=True)
+
+            latest_path  = os.path.join(args.ali_normality_scores,           "ali_normality_scores.csv")
+            all_yrs_path = os.path.join(args.ali_normality_scores_all_years, "ali_normality_scores_all_years.csv")
+
+            mode = args.output_mode
+
+            if mode in ("latest", "both"):
+                df_latest.round(args.round_decimals).to_csv(latest_path)
+                logger.info("Saved latest-year ALI normality scores -> %s", latest_path)
+            else:
+                pd.DataFrame().to_csv(latest_path)
+                logger.info("output_mode=%s: skipped latest-year (placeholder written)", mode)
+
+            if mode in ("all", "both"):
+                df_all.round(args.round_decimals).to_csv(all_yrs_path, index=False)
+                logger.info("Saved all-years ALI normality scores -> %s", all_yrs_path)
+            else:
+                pd.DataFrame().to_csv(all_yrs_path, index=False)
+                logger.info("output_mode=%s: skipped all-years (placeholder written)", mode)
+
+            with open(args.ali_normality_scores + ".meta.json", "w") as f:
+                json.dump({
+                    "path":            latest_path,
+                    "output_mode":     mode,
+                    "markets":         len(df_latest),
+                    "fields":          len(ALI_FIELDS),
+                    "total_vector_size": TOTAL_VECTOR_SIZE,
+                    "round_decimals":  args.round_decimals,
+                }, f, indent=2)
+
+            with open(args.ali_normality_scores_all_years + ".meta.json", "w") as f:
+                json.dump({
+                    "path":            all_yrs_path,
+                    "output_mode":     mode,
+                    "rows":            len(df_all),
+                    "fields":          len(ALI_FIELDS),
+                    "total_vector_size": TOTAL_VECTOR_SIZE,
+                    "round_decimals":  args.round_decimals,
+                }, f, indent=2)
+
+        except Exception as e:
+            logger.exception("Fatal error: %s", str(e))
+            sys.exit(1)
+
+    args:
+      - --e_m_data
+      - {inputPath: e_m_data}
+      - --total_vector_size
+      - {inputValue: total_vector_size}
+      - --output_mode
+      - {inputValue: output_mode}
+      - --round_decimals
+      - {inputValue: round_decimals}
+      - --regime_dims
+      - {inputValue: regime_dims}
+      - --ali_normality_scores
+      - {outputPath: ali_normality_scores}
+      - --ali_normality_scores_all_years
+      - {outputPath: ali_normality_scores_all_years}
