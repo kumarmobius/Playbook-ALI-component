@@ -1,0 +1,332 @@
+name: ALI Score Calculator
+description: "Merges ALI C1-C4 all-years CSVs with sigma data to compute T1 per field, ALI composite, CI half-width, and 4-tier gate per market x year. Outputs latest, all-years, or both."
+
+inputs:
+  - {name: ali_agreement_scores,   type: Data,    description: "Input directory containing ali_agreement_scores_all_years.csv"}
+  - {name: ali_normality_scores,   type: Data,    description: "Input directory containing ali_normality_scores_all_years.csv"}
+  - {name: ali_anchor_scores,      type: Data,    description: "Input directory containing ali_anchor_scores_all_years.csv"}
+  - {name: ali_confidence_scores,  type: Data,    description: "Input directory containing ali_confidence_scores_all_years.csv"}
+  - {name: sigma_data,             type: Data,    description: "Input directory containing the sigma embeddings CSV file"}
+  - {name: threshold_config,       type: Data,    description: "Input directory containing sigma_threshold.json with sigma_threshold key"}
+  - {name: w1,                     type: String,  default: "0.4",                                        description: "Weight for agreement scores (C1) in T1 weighted sum"}
+  - {name: w2,                     type: String,  default: "0.3",                                        description: "Weight for normality scores (C2) in T1 weighted sum"}
+  - {name: w3,                     type: String,  default: "0.3",                                        description: "Weight for anchor scores (C3) in T1 weighted sum"}
+  - {name: ali_weights,            type: String,  default: '{"D":0.25,"IA":0.20,"CF":0.20,"RP":0.20,"F":0.15}', description: "JSON string mapping ALI field to composite weight"}
+  - {name: ali_gate,               type: String,  default: "0.65",                                       description: "ALI gate threshold for 4-tier classification"}
+  - {name: ci_scale,               type: String,  default: "2.0",                                        description: "CI scaling factor applied to mean sigma regime values"}
+  - {name: output_mode,            type: String,  default: "both",                                       description: "Output mode: latest, all, or both"}
+  - {name: round_decimals,         type: Integer, default: "6",                                          description: "Decimal places to round output scores"}
+
+outputs:
+  - {name: ali_scores,          type: Data, description: "ali_scores.csv — latest year per market (indexed by market)"}
+  - {name: ali_scores_all_years, type: Data, description: "ali_scores_all_years.csv — all years (no index)"}
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:v1
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, json, logging
+        import numpy as np
+        import pandas as pd
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--ali_agreement_scores',          required=True)
+        parser.add_argument('--ali_normality_scores',          required=True)
+        parser.add_argument('--ali_anchor_scores',             required=True)
+        parser.add_argument('--ali_confidence_scores',         required=True)
+        parser.add_argument('--sigma_data',                    required=True)
+        parser.add_argument('--threshold_config',              required=True)
+        parser.add_argument('--w1',                            type=float, default=0.4)
+        parser.add_argument('--w2',                            type=float, default=0.3)
+        parser.add_argument('--w3',                            type=float, default=0.3)
+        parser.add_argument('--ali_weights',                   type=str,   default='{"D":0.25,"IA":0.20,"CF":0.20,"RP":0.20,"F":0.15}')
+        parser.add_argument('--ali_gate',                      type=float, default=0.65)
+        parser.add_argument('--ci_scale',                      type=float, default=2.0)
+        parser.add_argument('--output_mode',                   type=str,   default='both',
+                            choices=['latest', 'all', 'both'])
+        parser.add_argument('--round_decimals',                type=int,   default=6)
+        parser.add_argument('--ali_scores',                    required=True)
+        parser.add_argument('--ali_scores_all_years',          required=True)
+        args = parser.parse_args()
+
+        logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+        logger = logging.getLogger("ali_score_calculator")
+
+        ALI_WEIGHTS = {k: float(v) for k, v in json.loads(args.ali_weights).items()}
+        ALI_FIELDS  = list(ALI_WEIGHTS.keys())
+        ALI_GATE    = args.ali_gate
+        CI_SCALE    = args.ci_scale
+
+        ISO3_TO_TWO   = {"DEU":"DE","IND":"IN","NLD":"NL","NGA":"NG","USA":"US"}
+        TWO_TO_MARKET = {"DE":"DE-HC","IN":"IN-LOG","NL":"NL-AG","NG":"NG-FIN","US":"US-ENR"}
+
+        ALI_REGIME_DIMS = {
+            "D":  [128, 160],
+            "IA": [32,   64],
+            "CF": [64,   96],
+            "RP": [96,  128],
+            "F":  [288, 320],
+        }
+
+        def resolve_csv_path(input_dir, stem):
+            candidates = [
+                os.path.join(input_dir, stem + ".csv"),
+                os.path.join(input_dir, stem),
+            ]
+            for path in candidates:
+                if os.path.isfile(path):
+                    logger.info("Resolved input file: %s", path)
+                    return path
+            for fname in os.listdir(input_dir):
+                if fname.endswith(".csv"):
+                    path = os.path.join(input_dir, fname)
+                    logger.warning("Fallback CSV file used: %s", path)
+                    return path
+            all_files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+            if all_files:
+                path = os.path.join(input_dir, all_files[0])
+                logger.warning("Last-resort file used: %s", path)
+                return path
+            raise FileNotFoundError("No readable input file found in: %s  contents: %s" % (input_dir, os.listdir(input_dir)))
+
+        def resolve_json_path(input_dir, stem):
+            candidates = [
+                os.path.join(input_dir, stem + ".json"),
+                os.path.join(input_dir, stem),
+            ]
+            for path in candidates:
+                if os.path.isfile(path):
+                    logger.info("Resolved JSON file: %s", path)
+                    return path
+            for fname in os.listdir(input_dir):
+                if fname.endswith(".json"):
+                    path = os.path.join(input_dir, fname)
+                    logger.warning("Fallback JSON file used: %s", path)
+                    return path
+            all_files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+            if all_files:
+                try:
+                    path = os.path.join(input_dir, all_files[0])
+                    json.load(open(path))
+                    logger.warning("Last-resort JSON file used: %s", path)
+                    return path
+                except (json.JSONDecodeError, OSError):
+                    pass
+            raise FileNotFoundError("No JSON file found in: %s  contents: %s" % (input_dir, os.listdir(input_dir)))
+
+        def sigmoid(x):
+            return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
+
+        def compute_ali_ci(sigma_row):
+            if sigma_row is None:
+                return np.nan
+            s_cols = sorted([c for c in sigma_row.index if c.startswith("s_")],
+                            key=lambda x: int(x.split("_")[1]))
+            if not s_cols:
+                return np.nan
+            vec = np.array([float(sigma_row[c]) for c in s_cols], dtype=np.float64)
+            field_cis = {}
+            for field in ALI_FIELDS:
+                if field == "IA":
+                    ms = float(np.mean(np.concatenate([vec[32:64], vec[160:192]])))
+                else:
+                    s, e = ALI_REGIME_DIMS[field]
+                    ms   = float(np.mean(vec[s:e]))
+                field_cis[field] = CI_SCALE * ms
+            return round(float(sum(ALI_WEIGHTS[f] * field_cis[f] for f in ALI_FIELDS)), args.round_decimals)
+
+        def gate_result(ali, ci):
+            if np.isnan(ali) or np.isnan(ci):
+                return "MISSING"
+            lower, upper = ali - ci, ali + ci
+            if ali >= ALI_GATE and lower >= ALI_GATE:
+                return "CONFIDENT_PASS"
+            elif ali >= ALI_GATE and lower < ALI_GATE:
+                return "BORDERLINE_PASS"
+            elif ali < ALI_GATE and upper < ALI_GATE:
+                return "CONFIDENT_FAIL"
+            else:
+                return "BORDERLINE_FAIL"
+
+        def load_inputs():
+            c1 = pd.read_csv(resolve_csv_path(args.ali_agreement_scores,  "ali_agreement_scores_all_years"))
+            c2 = pd.read_csv(resolve_csv_path(args.ali_normality_scores,  "ali_normality_scores_all_years"))
+            c3 = pd.read_csv(resolve_csv_path(args.ali_anchor_scores,     "ali_anchor_scores_all_years"))
+            c4 = pd.read_csv(resolve_csv_path(args.ali_confidence_scores, "ali_confidence_scores_all_years"))
+            c3["country"] = c3["country"].map(ISO3_TO_TWO).fillna(c3["country"])
+            c3["market"]  = c3["country"].map(TWO_TO_MARKET)
+            c3 = c3.dropna(subset=["market"]).drop(columns=["country"])
+            df_sigma = pd.read_csv(resolve_csv_path(args.sigma_data, "mock_sigma_m"))
+            sigma_threshold = json.load(open(resolve_json_path(args.threshold_config, "sigma_threshold")))["sigma_threshold"]
+            logger.info("C1:%s C2:%s C3:%s C4:%s sigma:%s threshold=%.6f",
+                        c1.shape, c2.shape, c3.shape, c4.shape, df_sigma.shape, sigma_threshold)
+            return c1, c2, c3, c4, df_sigma, sigma_threshold
+
+        def compute_ali(c1, c2, c3, c4, df_sigma, sigma_threshold):
+            df = (c1.merge(c2, on=["market","year"], suffixes=("_c1","_c2"))
+                    .merge(c3, on=["market","year"])
+                    .merge(c4, on=["market","year"], suffixes=("","_c4")))
+            records = []
+            for _, row in df.iterrows():
+                market = row["market"]
+                year   = int(row["year"])
+                record = {"market": market, "year": year}
+                t1_vals = {}
+                for field in ALI_FIELDS:
+                    v1 = row.get(f"{field}_c1", np.nan)
+                    v2 = row.get(f"{field}_c2", np.nan)
+                    v3 = row.get(field,          np.nan)
+                    v4 = row.get(f"{field}_c4",  np.nan)
+                    try:
+                        v1, v2, v3, v4 = float(v1), float(v2), float(v3), float(v4)
+                    except (TypeError, ValueError):
+                        record[f"T1_{field}"] = np.nan
+                        t1_vals[field]        = np.nan
+                        continue
+                    if any(np.isnan(v) for v in [v1, v2, v3, v4]):
+                        record[f"T1_{field}"] = np.nan
+                        t1_vals[field]        = np.nan
+                    else:
+                        raw                   = args.w1*v1 + args.w2*v2 + args.w3*v3
+                        t1                    = round(float(sigmoid(raw) * v4), args.round_decimals)
+                        record[f"T1_{field}"] = t1
+                        t1_vals[field]        = t1
+                if any(np.isnan(v) for v in t1_vals.values()):
+                    record["ALI"] = np.nan
+                else:
+                    record["ALI"] = round(float(sigmoid(sum(ALI_WEIGHTS[f] * t1_vals[f] for f in ALI_FIELDS))), args.round_decimals)
+                sig_match = df_sigma[(df_sigma.market == market) & (df_sigma.year == year)]
+                ci = compute_ali_ci(sig_match.iloc[0] if not sig_match.empty else None)
+                ali_val = record.get("ALI", np.nan)
+                record["CI_half_width"] = ci
+                record["ALI_lower"]     = round(ali_val - ci, args.round_decimals) if not (np.isnan(ali_val) or np.isnan(ci)) else np.nan
+                record["ALI_upper"]     = round(ali_val + ci, args.round_decimals) if not (np.isnan(ali_val) or np.isnan(ci)) else np.nan
+                record["gate"]          = gate_result(ali_val, ci)
+                records.append(record)
+            return pd.DataFrame(records)
+
+        def get_latest_year(df_all):
+            idx = df_all.groupby("market")["year"].idxmax()
+            return df_all.loc[idx].drop(columns=["year"]).set_index("market")
+
+        def report_nulls(df_latest):
+            score_cols  = [f"T1_{f}" for f in ALI_FIELDS] + ["ALI","CI_half_width"]
+            null_counts = df_latest[score_cols].isna().sum()
+            null_counts  = null_counts[null_counts > 0]
+            if not null_counts.empty:
+                logger.warning("Null ALI scores detected:")
+                for col, cnt in null_counts.items():
+                    logger.warning("  %s: %d null(s)", col, cnt)
+            else:
+                logger.info("No null ALI scores found.")
+
+        try:
+            logger.info("w1=%.2f  w2=%.2f  w3=%.2f  ali_gate=%.2f  ci_scale=%.2f  output_mode=%s",
+                        args.w1, args.w2, args.w3, ALI_GATE, CI_SCALE, args.output_mode)
+            logger.info("ALI_WEIGHTS=%s", ALI_WEIGHTS)
+
+            c1, c2, c3, c4, df_sigma, sigma_threshold = load_inputs()
+            df_all    = compute_ali(c1, c2, c3, c4, df_sigma, sigma_threshold)
+            df_latest = get_latest_year(df_all)
+
+            logger.info("All years rows: %d  years=%s", len(df_all), sorted(df_all.year.unique().tolist()))
+            out_cols = [f"T1_{f}" for f in ALI_FIELDS] + ["ALI","CI_half_width","ALI_lower","ALI_upper","gate"]
+            logger.info("=== ALI Scores + CI + Gate (latest year) ===")
+            logger.info("%s", df_latest[out_cols].round(4).to_string())
+            logger.info("=== Gate distribution ===")
+            logger.info("%s", df_latest["gate"].value_counts().to_string())
+            report_nulls(df_latest)
+
+            os.makedirs(args.ali_scores,            exist_ok=True)
+            os.makedirs(args.ali_scores_all_years,  exist_ok=True)
+
+            latest_path  = os.path.join(args.ali_scores,           "ali_scores.csv")
+            all_yrs_path = os.path.join(args.ali_scores_all_years, "ali_scores_all_years.csv")
+
+            mode = args.output_mode
+
+            if mode in ("latest", "both"):
+                df_latest.round(args.round_decimals).to_csv(latest_path)
+                logger.info("Saved latest-year ALI scores -> %s", latest_path)
+            else:
+                pd.DataFrame().to_csv(latest_path)
+                logger.info("output_mode=%s: skipped latest-year (placeholder written)", mode)
+
+            if mode in ("all", "both"):
+                df_all.round(args.round_decimals).to_csv(all_yrs_path, index=False)
+                logger.info("Saved all-years ALI scores -> %s", all_yrs_path)
+            else:
+                pd.DataFrame().to_csv(all_yrs_path, index=False)
+                logger.info("output_mode=%s: skipped all-years (placeholder written)", mode)
+
+            with open(args.ali_scores + ".meta.json", "w") as f:
+                json.dump({
+                    "path":          latest_path,
+                    "output_mode":   mode,
+                    "markets":       len(df_latest),
+                    "fields":        len(ALI_FIELDS),
+                    "w1":            args.w1,
+                    "w2":            args.w2,
+                    "w3":            args.w3,
+                    "ali_weights":   ALI_WEIGHTS,
+                    "ali_gate":      ALI_GATE,
+                    "ci_scale":      CI_SCALE,
+                    "round_decimals": args.round_decimals,
+                }, f, indent=2)
+
+            with open(args.ali_scores_all_years + ".meta.json", "w") as f:
+                json.dump({
+                    "path":          all_yrs_path,
+                    "output_mode":   mode,
+                    "rows":          len(df_all),
+                    "fields":        len(ALI_FIELDS),
+                    "w1":            args.w1,
+                    "w2":            args.w2,
+                    "w3":            args.w3,
+                    "ali_weights":   ALI_WEIGHTS,
+                    "ali_gate":      ALI_GATE,
+                    "ci_scale":      CI_SCALE,
+                    "round_decimals": args.round_decimals,
+                }, f, indent=2)
+
+        except Exception as e:
+            logger.exception("Fatal error: %s", str(e))
+            sys.exit(1)
+
+    args:
+      - --ali_agreement_scores
+      - {inputPath: ali_agreement_scores}
+      - --ali_normality_scores
+      - {inputPath: ali_normality_scores}
+      - --ali_anchor_scores
+      - {inputPath: ali_anchor_scores}
+      - --ali_confidence_scores
+      - {inputPath: ali_confidence_scores}
+      - --sigma_data
+      - {inputPath: sigma_data}
+      - --threshold_config
+      - {inputPath: threshold_config}
+      - --w1
+      - {inputValue: w1}
+      - --w2
+      - {inputValue: w2}
+      - --w3
+      - {inputValue: w3}
+      - --ali_weights
+      - {inputValue: ali_weights}
+      - --ali_gate
+      - {inputValue: ali_gate}
+      - --ci_scale
+      - {inputValue: ci_scale}
+      - --output_mode
+      - {inputValue: output_mode}
+      - --round_decimals
+      - {inputValue: round_decimals}
+      - --ali_scores
+      - {outputPath: ali_scores}
+      - --ali_scores_all_years
+      - {outputPath: ali_scores_all_years}
