@@ -1,0 +1,246 @@
+name: ALI Confidence Score Calculator
+description: "Computes sigmoid-based confidence scores for ALI C4 fields per market x year from sigma vectors. Outputs latest, all-years, or both. ALI_C4_CONFIG hardcoded; REGIME_DIMS and K configurable."
+
+inputs:
+  - {name: sigma_data,        type: Data,    description: "Input directory containing the sigma embeddings CSV file"}
+  - {name: threshold_config,  type: Data,    description: "Input directory containing sigma_threshold.json with sigma_threshold key"}
+  - {name: regime_dims,       type: String,  description: "Required JSON string mapping regime_key to [start, end] e.g. {political:[0,32],agency:[288,320]}"}
+  - {name: latent_dim,        type: Integer, default: "320",  description: "Total dimensionality of the sigma vector (s_0 to s_N-1)"}
+  - {name: k_steepness,       type: Integer, default: "5",    description: "Sigmoid steepness scaling factor K (integer) used in confidence computation"}
+  - {name: output_mode,       type: String,  default: "both", description: "Output mode: latest, all, or both"}
+  - {name: round_decimals,    type: Integer, default: "6",    description: "Decimal places to round output confidence scores"}
+
+outputs:
+  - {name: ali_confidence_scores,          type: Data, description: "ali_confidence_scores.csv — latest year per market (indexed by market)"}
+  - {name: ali_confidence_scores_all_years, type: Data, description: "ali_confidence_scores_all_years.csv — all years (no index)"}
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:v1
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse, os, sys, json, logging
+        import numpy as np
+        import pandas as pd
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--sigma_data',                          required=True)
+        parser.add_argument('--threshold_config',                    required=True)
+        parser.add_argument('--regime_dims',                         type=str, required=True)
+        parser.add_argument('--latent_dim',                          type=int, default=320)
+        parser.add_argument('--k_steepness',                         type=int, default=5)
+        parser.add_argument('--output_mode',                         type=str, default='both',
+                            choices=['latest', 'all', 'both'])
+        parser.add_argument('--round_decimals',                      type=int, default=6)
+        parser.add_argument('--ali_confidence_scores',               required=True)
+        parser.add_argument('--ali_confidence_scores_all_years',     required=True)
+        args = parser.parse_args()
+
+        logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+        logger = logging.getLogger("ali_confidence_score_calculator")
+
+        if not args.regime_dims or args.regime_dims.strip() in ('{}', '', 'null'):
+            raise ValueError("regime_dims is required — pass a non-empty JSON string mapping regime_key to [start, end]")
+        REGIME_DIMS = {k: [int(v[0]), int(v[1])] for k, v in json.loads(args.regime_dims).items()}
+        logger.info("REGIME_DIMS loaded from input  keys=%d", len(REGIME_DIMS))
+
+        LATENT_DIM = args.latent_dim
+        K          = float(args.k_steepness)
+        SIGMA_COLS = [f"s_{i}" for i in range(LATENT_DIM)]
+
+        ALI_C4_CONFIG = {
+            "D":  "techprod",
+            "IA": ["measurement", "operational"],
+            "CF": "coordination",
+            "RP": "regulatory",
+            "F":  "agency",
+        }
+
+        ALI_FIELDS = list(ALI_C4_CONFIG.keys())
+
+        def resolve_csv_path(input_dir, stem):
+            candidates = [
+                os.path.join(input_dir, stem + ".csv"),
+                os.path.join(input_dir, stem),
+            ]
+            for path in candidates:
+                if os.path.isfile(path):
+                    logger.info("Resolved input file: %s", path)
+                    return path
+            for fname in os.listdir(input_dir):
+                if fname.endswith(".csv"):
+                    path = os.path.join(input_dir, fname)
+                    logger.warning("Fallback CSV file used: %s", path)
+                    return path
+            all_files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+            if all_files:
+                path = os.path.join(input_dir, all_files[0])
+                logger.warning("Last-resort file used: %s", path)
+                return path
+            raise FileNotFoundError("No readable input file found in: %s  contents: %s" % (input_dir, os.listdir(input_dir)))
+
+        def resolve_json_path(input_dir, stem):
+            candidates = [
+                os.path.join(input_dir, stem + ".json"),
+                os.path.join(input_dir, stem),
+            ]
+            for path in candidates:
+                if os.path.isfile(path):
+                    logger.info("Resolved JSON file: %s", path)
+                    return path
+            for fname in os.listdir(input_dir):
+                if fname.endswith(".json"):
+                    path = os.path.join(input_dir, fname)
+                    logger.warning("Fallback JSON file used: %s", path)
+                    return path
+            all_files = [f for f in os.listdir(input_dir) if os.path.isfile(os.path.join(input_dir, f))]
+            if all_files:
+                try:
+                    path = os.path.join(input_dir, all_files[0])
+                    json.load(open(path))
+                    logger.warning("Last-resort JSON file used: %s", path)
+                    return path
+                except (json.JSONDecodeError, OSError):
+                    pass
+            raise FileNotFoundError("No JSON file found in: %s  contents: %s" % (input_dir, os.listdir(input_dir)))
+
+        def sigmoid(x):
+            return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
+
+        def compute_confidence_row(row, sigma_threshold):
+            vec     = np.array([float(row[c]) for c in SIGMA_COLS], dtype=np.float64)
+            results = {}
+            for field, regime_key in ALI_C4_CONFIG.items():
+                if isinstance(regime_key, list):
+                    slices = np.concatenate([vec[REGIME_DIMS[r][0]:REGIME_DIMS[r][1]] for r in regime_key])
+                    ms     = float(np.mean(slices))
+                else:
+                    s, e = REGIME_DIMS[regime_key]
+                    ms   = float(np.mean(vec[s:e]))
+                results[field] = round(1.0 - sigmoid(K * (ms - sigma_threshold)), args.round_decimals)
+            return results
+
+        def compute_all(df, sigma_threshold):
+            records = []
+            for _, row in df.iterrows():
+                missing = [c for c in SIGMA_COLS if c not in row]
+                if missing:
+                    logger.warning("Row market=%s year=%s missing %d sigma cols — skipping",
+                                   row.get("market"), row.get("year"), len(missing))
+                    continue
+                scores = compute_confidence_row(row, sigma_threshold)
+                record = {"market": row["market"], "year": int(row["year"])}
+                record.update(scores)
+                records.append(record)
+            return pd.DataFrame(records)
+
+        def get_latest_year(df_all):
+            idx = df_all.groupby("market")["year"].idxmax()
+            return df_all.loc[idx].drop(columns=["year"]).set_index("market")
+
+        def report_nulls(df_latest):
+            null_counts = df_latest.isna().sum()
+            null_counts  = null_counts[null_counts > 0]
+            if not null_counts.empty:
+                logger.warning("Null ALI confidence scores detected:")
+                for field, cnt in null_counts.items():
+                    markets = df_latest[df_latest[field].isna()].index.tolist()
+                    logger.warning("  %s (%d): %s", field, cnt, markets)
+            else:
+                logger.info("No null ALI confidence scores found.")
+
+        try:
+            logger.info("Scanning sigma_data dir: %s  contents=%s", args.sigma_data, os.listdir(args.sigma_data))
+            logger.info("Scanning threshold_config dir: %s  contents=%s", args.threshold_config, os.listdir(args.threshold_config))
+
+            json_path       = resolve_json_path(args.threshold_config, "sigma_threshold")
+            sigma_threshold = json.load(open(json_path))["sigma_threshold"]
+            logger.info("sigma_threshold=%.6f  K=%.1f  latent_dim=%d  output_mode=%s",
+                        sigma_threshold, K, LATENT_DIM, args.output_mode)
+
+            csv_path = resolve_csv_path(args.sigma_data, "mock_sigma_m")
+            df_raw   = pd.read_csv(csv_path)
+            assert "market" in df_raw.columns, "Missing 'market' column"
+            assert "year"   in df_raw.columns, "Missing 'year' column"
+            assert "s_0"    in df_raw.columns, "Missing sigma vector columns (s_0 ...)"
+            logger.info("Loaded shape=%s", df_raw.shape)
+
+            df_all    = compute_all(df_raw, sigma_threshold)
+            df_latest = get_latest_year(df_all)
+
+            logger.info("=== ALI Confidence Scores (latest year) ===")
+            logger.info("%s", df_latest[ALI_FIELDS].round(4).to_string())
+            report_nulls(df_latest)
+
+            os.makedirs(args.ali_confidence_scores,            exist_ok=True)
+            os.makedirs(args.ali_confidence_scores_all_years,  exist_ok=True)
+
+            latest_path  = os.path.join(args.ali_confidence_scores,           "ali_confidence_scores.csv")
+            all_yrs_path = os.path.join(args.ali_confidence_scores_all_years, "ali_confidence_scores_all_years.csv")
+
+            mode = args.output_mode
+
+            if mode in ("latest", "both"):
+                df_latest.round(args.round_decimals).to_csv(latest_path)
+                logger.info("Saved latest-year ALI confidence scores -> %s", latest_path)
+            else:
+                pd.DataFrame().to_csv(latest_path)
+                logger.info("output_mode=%s: skipped latest-year (placeholder written)", mode)
+
+            if mode in ("all", "both"):
+                df_all.round(args.round_decimals).to_csv(all_yrs_path, index=False)
+                logger.info("Saved all-years ALI confidence scores -> %s", all_yrs_path)
+            else:
+                pd.DataFrame().to_csv(all_yrs_path, index=False)
+                logger.info("output_mode=%s: skipped all-years (placeholder written)", mode)
+
+            with open(args.ali_confidence_scores + ".meta.json", "w") as f:
+                json.dump({
+                    "path":            latest_path,
+                    "output_mode":     mode,
+                    "markets":         len(df_latest),
+                    "fields":          len(ALI_FIELDS),
+                    "sigma_threshold": sigma_threshold,
+                    "k_steepness":     K,
+                    "latent_dim":      LATENT_DIM,
+                    "round_decimals":  args.round_decimals,
+                }, f, indent=2)
+
+            with open(args.ali_confidence_scores_all_years + ".meta.json", "w") as f:
+                json.dump({
+                    "path":            all_yrs_path,
+                    "output_mode":     mode,
+                    "rows":            len(df_all),
+                    "fields":          len(ALI_FIELDS),
+                    "sigma_threshold": sigma_threshold,
+                    "k_steepness":     K,
+                    "latent_dim":      LATENT_DIM,
+                    "round_decimals":  args.round_decimals,
+                }, f, indent=2)
+
+        except Exception as e:
+            logger.exception("Fatal error: %s", str(e))
+            sys.exit(1)
+
+    args:
+      - --sigma_data
+      - {inputPath: sigma_data}
+      - --threshold_config
+      - {inputPath: threshold_config}
+      - --regime_dims
+      - {inputValue: regime_dims}
+      - --latent_dim
+      - {inputValue: latent_dim}
+      - --k_steepness
+      - {inputValue: k_steepness}
+      - --output_mode
+      - {inputValue: output_mode}
+      - --round_decimals
+      - {inputValue: round_decimals}
+      - --ali_confidence_scores
+      - {outputPath: ali_confidence_scores}
+      - --ali_confidence_scores_all_years
+      - {outputPath: ali_confidence_scores_all_years}
